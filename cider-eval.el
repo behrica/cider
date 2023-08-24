@@ -524,8 +524,8 @@ into a new error buffer."
            (unless (member ex-phase cider-clojure-compilation-error-phases)
              (cider--render-stacktrace-causes causes))))))
 
-(defun cider-default-err-op-handler ()
-  "Display the last exception, with middleware support."
+(defun cider-default-err-op-handler (&optional source-buffer in-progress-var)
+  "Display the last exception, observing SOURCE-BUFFER IN-PROGRESS-VAR."
   ;; Causes are returned as a series of messages, which we aggregate in `causes'
   (let (causes ex-phase)
     (cider-nrepl-send-request
@@ -535,9 +535,13 @@ into a new error buffer."
                   (cider--nrepl-print-request-map fill-column))
        (seq-mapcat #'identity))
      (lambda (response)
-       (nrepl-dbind-response response (phase)
+       (nrepl-dbind-response response (phase message)
          (when phase
-           (setq ex-phase phase)))
+           (setq ex-phase phase)
+           (when (and source-buffer message)
+             (cider-handle-compilation-errors message source-buffer)
+             (with-current-buffer source-buffer
+               (set in-progress-var nil)))))
        ;; While the return value of `cider--handle-stacktrace-response' is not
        ;; meaningful for the last message, we do not need the value of `causes'
        ;; after it has been handled, so it's fine to set it unconditionally here
@@ -711,13 +715,46 @@ evaluation command.  Honor `cider-auto-jump-to-error'."
               (cider-jump-to (nth 2 loc) (car loc)))))))))
 
 
+
+(defvar-local cider-insert-eval-handler--error-handling-in-progress
+  nil
+  "Whether there's an error handling async op currently in progress.
+\(For a given `cider-insert-eval-handler')
+
+Observing this flags allows us to ensure only one async op
+is being processed at a time.
+Otherwise, we risk falling into an infinite loop if that op itself
+incurs into an error.")
+
+(defvar-local cider-interactive-eval-handler--error-handling-in-progress
+  nil
+  "Whether there's an error handling async op currently in progress.
+\(For a given `cider-interactive-eval-handler')
+
+Observing this flags allows us to ensure only one async op
+is being processed at a time.
+Otherwise, we risk falling into an infinite loop if that op itself
+incurs into an error.")
+
+(defvar-local cider-load-file-handler--error-handling-in-progress
+  nil
+  "Whether there's an error handling async op currently in progress.
+\(For a given `cider-load-file-handler')
+
+Observing this flags allows us to ensure only one async op
+is being processed at a time.
+Otherwise, we risk falling into an infinite loop if that op
+itself incurs into an error.")
+
 ;;; Interactive evaluation handlers
 (defun cider-insert-eval-handler (&optional buffer)
   "Make an nREPL evaluation handler for the BUFFER.
 The handler simply inserts the result value in BUFFER."
-  (let ((eval-buffer (current-buffer))
-        (res ""))
-    (nrepl-make-response-handler (or buffer eval-buffer)
+  (let* ((eval-buffer (current-buffer))
+         (res "")
+         (conn-buffer (or buffer eval-buffer))
+         (supported (cider-nrepl-op-supported-p "analyze-last-stacktrace")))
+    (nrepl-make-response-handler conn-buffer
                                  (lambda (_buffer value)
                                    (with-current-buffer buffer
                                      (insert value))
@@ -726,8 +763,13 @@ The handler simply inserts the result value in BUFFER."
                                  (lambda (_buffer out)
                                    (cider-repl-emit-interactive-stdout out))
                                  (lambda (_buffer err)
-                                   (cider-handle-compilation-errors err eval-buffer))
+                                   (unless supported
+                                     (cider-handle-compilation-errors err eval-buffer)))
                                  (lambda (_buffer)
+                                   (when supported
+                                     (let ((var 'cider-insert-eval-handler--error-handling-in-progress))
+                                       (unless (buffer-local-value var eval-buffer)
+                                         (cider-default-err-op-handler eval-buffer var))))
                                    (when cider-eval-register
                                      (set-register cider-eval-register res))))))
 
@@ -789,8 +831,10 @@ when `cider-auto-inspect-after-eval' is non-nil."
          (beg (when beg (copy-marker beg)))
          (end (when end (copy-marker end)))
          (fringed nil)
-         (res ""))
-    (nrepl-make-response-handler (or buffer eval-buffer)
+         (res "")
+         (conn-buffer (or buffer eval-buffer))
+         (supported (cider-nrepl-op-supported-p "analyze-last-stacktrace")))
+    (nrepl-make-response-handler conn-buffer
                                  (lambda (_buffer value)
                                    (setq res (concat res value))
                                    (cider--display-interactive-eval-result res end))
@@ -806,8 +850,13 @@ when `cider-auto-inspect-after-eval' is non-nil."
                                      (let ((cider-result-use-clojure-font-lock nil))
                                        (cider--display-interactive-eval-result
                                         err end 'cider-error-overlay-face)))
-                                   (cider-handle-compilation-errors err eval-buffer))
+                                   (unless supported
+                                     (cider-handle-compilation-errors err eval-buffer)))
                                  (lambda (buffer)
+                                   (when supported
+                                     (let ((var 'cider-interactive-eval-handler--error-handling-in-progress))
+                                       (unless (buffer-local-value var eval-buffer)
+                                         (cider-default-err-op-handler eval-buffer var))))
                                    (if beg
                                        (unless fringed
                                          (cider--make-fringe-overlays-for-region beg end)
@@ -821,13 +870,14 @@ when `cider-auto-inspect-after-eval' is non-nil."
                                    (when cider-eval-register
                                      (set-register cider-eval-register res))))))
 
-
 (defun cider-load-file-handler (&optional buffer done-handler)
   "Make a load file handler for BUFFER.
 Optional argument DONE-HANDLER lambda will be run once load is complete."
-  (let ((eval-buffer (current-buffer))
-        (res ""))
-    (nrepl-make-response-handler (or buffer eval-buffer)
+  (let* ((eval-buffer (current-buffer))
+         (res "")
+         (conn-buffer (or buffer eval-buffer))
+         (supported (cider-nrepl-op-supported-p "analyze-last-stacktrace")))
+    (nrepl-make-response-handler conn-buffer
                                  (lambda (buffer value)
                                    (cider--display-interactive-eval-result value)
                                    (when cider-eval-register
@@ -840,8 +890,14 @@ Optional argument DONE-HANDLER lambda will be run once load is complete."
                                    (cider-emit-interactive-eval-output value))
                                  (lambda (_buffer err)
                                    (cider-emit-interactive-eval-err-output err)
-                                   (cider-handle-compilation-errors err eval-buffer))
+                                   (unless supported
+                                     (cider-handle-compilation-errors err eval-buffer)))
                                  (lambda (buffer)
+                                   ;; TODO impl and QA for code paths (3 handlers, tramp, cljs)
+                                   (when supported
+                                     (let ((var 'cider-load-file-handler--error-handling-in-progress))
+                                       (unless (buffer-local-value var eval-buffer)
+                                         (cider-default-err-op-handler eval-buffer var))))
                                    (when cider-eval-register
                                      (set-register cider-eval-register res))
                                    (when done-handler
